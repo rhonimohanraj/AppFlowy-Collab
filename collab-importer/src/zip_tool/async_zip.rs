@@ -20,7 +20,7 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::error::ImporterError;
 use crate::zip_tool::util::{is_multi_part_zip_signature, remove_part_suffix, sanitize_file_path};
-use tracing::error;
+use tracing::{error, warn};
 
 pub struct UnzipFile {
   pub file_name: String,
@@ -144,11 +144,25 @@ where
         })
       },
     },
-    Some(file_name) => Ok(UnzipFile {
-      file_name: file_name.clone(),
-      unzip_dir_path: out_dir.join(file_name),
-      parts,
-    }),
+    Some(file_name) => {
+      let target_dir = out_dir.join(&file_name);
+      if !target_dir.exists() {
+        warn!(
+          "Root directory {:?} missing after unzip; falling back to {:?}",
+          target_dir, out_dir
+        );
+        return Ok(UnzipFile {
+          file_name,
+          unzip_dir_path: out_dir,
+          parts,
+        });
+      }
+      Ok(UnzipFile {
+        file_name: file_name.clone(),
+        unzip_dir_path: target_dir,
+        parts,
+      })
+    },
   }
 }
 

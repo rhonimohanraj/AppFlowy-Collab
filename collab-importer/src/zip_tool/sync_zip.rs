@@ -130,11 +130,25 @@ pub fn sync_unzip(
         parts,
       }),
     },
-    Some(root_dir) => Ok(UnzipFile {
-      dir_name: root_dir.clone(),
-      unzip_dir: out_dir.join(root_dir),
-      parts,
-    }),
+    Some(root_dir) => {
+      let target_dir = out_dir.join(&root_dir);
+      if !target_dir.exists() {
+        warn!(
+          "Root directory {:?} missing after unzip; falling back to {:?}",
+          target_dir, out_dir
+        );
+        return Ok(UnzipFile {
+          dir_name: root_dir,
+          unzip_dir: out_dir,
+          parts,
+        });
+      }
+      Ok(UnzipFile {
+        dir_name: root_dir.clone(),
+        unzip_dir: target_dir,
+        parts,
+      })
+    },
   }
 }
 
