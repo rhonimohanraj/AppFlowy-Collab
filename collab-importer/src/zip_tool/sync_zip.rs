@@ -199,10 +199,13 @@ fn unzip_single_file(
         }
       }
 
-      // Create and write the file
+      // Create and write the file. Notion's workspace exports can include the same
+      // path multiple times (database views referencing the same source DB serialize
+      // to the same CSV path); overwrite on collision instead of erroring out.
       let mut outfile = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(&path)
         .map_err(|e| {
           ImporterError::Internal(anyhow!(
