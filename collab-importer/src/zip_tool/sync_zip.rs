@@ -70,10 +70,18 @@ pub fn sync_unzip(
           .map_err(|e| ImporterError::Internal(anyhow!("Failed to create parent dir: {:?}", e)))?;
       }
 
-      // Create and write the file
+      // Create and write the file. Use create+truncate (not create_new) so a stale
+      // file from a previous failed import — which the worker's clean_up doesn't
+      // always remove if it crashed mid-flight — gets overwritten instead of
+      // silently skipped. The silent skip path was particularly nasty for the
+      // outer-zip extraction: if the inner Part-N.zip was a stale leftover, the
+      // write was skipped, parts[] stayed empty, and the multipart-extract loop
+      // never ran — leaving the unzip_dir empty and `collect_pages` returning
+      // zero views → ImportCollabError(CannotImport).
       match OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(&output_path)
         .map_err(|e| {
           ImporterError::Internal(anyhow!(
