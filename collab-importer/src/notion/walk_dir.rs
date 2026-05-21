@@ -96,15 +96,21 @@ pub(crate) fn process_entry(
   } else if path.is_dir() {
     // If the path is a directory, it should contain a file with the same name but with either a .md or .csv extension.
     // If no such file is found, the directory will be treated as a space.
-    // Proceed to extract the name and ID for the directory.
-    let (name, id) = name_and_id_from_path(path).ok()?;
-
-    // Look for the corresponding .md file for this directory in the parent directory
+    //
+    // Notion historically named both the file and its companion folder with a uuid
+    // suffix (e.g. `Foo <uuid>.md` + `Foo <uuid>/`). In May 2026+ exports the folder
+    // name no longer carries the uuid (`Foo/`). We accept both forms.
+    let (name_from_dir, id_from_dir) = name_and_id_from_path(path).ok()?;
     let parent_path = path.parent()?;
-    let md_file_path = parent_path.join(format!("{}.md", entry_name));
-    let all_csv_file_path = parent_path.join(format!("{}_all.csv", entry_name));
-    let csv_file_path = parent_path.join(format!("{}.csv", entry_name));
-    if md_file_path.exists() {
+
+    let md_file_path = find_sibling_with_ext(parent_path, entry_name, "md");
+    let all_csv_file_path = find_sibling_all_csv(parent_path, entry_name);
+    let csv_file_path = find_sibling_partial_csv(parent_path, entry_name);
+
+    if let Some(md_file_path) = md_file_path {
+      // Prefer (name, id) from the .md filename because the folder may lack the uuid.
+      let (name, id) = name_and_id_from_path(&md_file_path)
+        .unwrap_or((name_from_dir.clone(), id_from_dir.clone()));
       process_md_dir(
         host,
         workspace_id,
@@ -115,7 +121,11 @@ pub(crate) fn process_entry(
         include_partial_csv,
         notion_export,
       )
-    } else if all_csv_file_path.exists() {
+    } else if let Some(all_csv_file_path) = all_csv_file_path {
+      let (name, id) = name_and_id_from_path(&all_csv_file_path)
+        .unwrap_or((name_from_dir.clone(), id_from_dir.clone()));
+      let csv_file_path = csv_file_path
+        .unwrap_or_else(|| parent_path.join(format!("{}.csv", entry_name)));
       process_csv_dir(
         entry_name,
         host,
@@ -128,11 +138,125 @@ pub(crate) fn process_entry(
         notion_export,
       )
     } else {
-      process_space_dir(host, workspace_id, name, id, path, notion_export)
+      process_space_dir(host, workspace_id, name_from_dir, id_from_dir, path, notion_export)
     }
   } else {
     None
   }
+}
+
+/// Strip a trailing " <hex32>" (uuid) from a file/folder stem. Returns `None` when no
+/// uuid is present. Used to bridge Notion's old per-page export format (folder named
+/// `Foo <uuid>`) with the May 2026+ format (folder named just `Foo`).
+pub(crate) fn strip_trailing_notion_uuid(stem: &str) -> Option<&str> {
+  if stem.len() < 33 {
+    return None;
+  }
+  let split = stem.len() - 32;
+  if !stem[..split].ends_with(' ') {
+    return None;
+  }
+  let tail = &stem[split..];
+  if is_lowercase_hex_32(tail) {
+    Some(&stem[..split - 1])
+  } else {
+    None
+  }
+}
+
+/// `true` iff `s` is exactly 32 lowercase hexadecimal characters (Notion's uuid form).
+fn is_lowercase_hex_32(s: &str) -> bool {
+  s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Find a sibling file in `parent` matching either `<dir_name>.<ext>` (folder + file
+/// share an exact name) or `<dir_name> <hex32>.<ext>` (file has uuid suffix, folder
+/// does not — Notion's current export format).
+fn find_sibling_with_ext(parent: &Path, dir_name: &str, ext: &str) -> Option<PathBuf> {
+  let exact = parent.join(format!("{}.{}", dir_name, ext));
+  if exact.exists() {
+    return Some(exact);
+  }
+  let prefix = format!("{} ", dir_name);
+  let dot_ext = format!(".{}", ext);
+  if let Ok(entries) = fs::read_dir(parent) {
+    for entry in entries.flatten() {
+      let name = match entry.file_name().into_string() {
+        Ok(s) => s,
+        Err(_) => continue,
+      };
+      if !name.ends_with(&dot_ext) {
+        continue;
+      }
+      let Some(rest) = name.strip_prefix(&prefix) else {
+        continue;
+      };
+      let stem_tail = rest.trim_end_matches(&dot_ext);
+      if is_lowercase_hex_32(stem_tail) {
+        return Some(entry.path());
+      }
+    }
+  }
+  None
+}
+
+/// Find the `<dir_name>_all.csv` companion, or `<dir_name> <uuid>_all.csv` (Notion's
+/// uuid-suffixed CSV emitted next to a uuid-less folder).
+fn find_sibling_all_csv(parent: &Path, dir_name: &str) -> Option<PathBuf> {
+  let exact = parent.join(format!("{}_all.csv", dir_name));
+  if exact.exists() {
+    return Some(exact);
+  }
+  let prefix = format!("{} ", dir_name);
+  let suffix = "_all.csv";
+  if let Ok(entries) = fs::read_dir(parent) {
+    for entry in entries.flatten() {
+      let name = match entry.file_name().into_string() {
+        Ok(s) => s,
+        Err(_) => continue,
+      };
+      if !name.ends_with(suffix) {
+        continue;
+      }
+      let Some(rest) = name.strip_prefix(&prefix) else {
+        continue;
+      };
+      let stem_tail = rest.trim_end_matches(suffix);
+      if is_lowercase_hex_32(stem_tail) {
+        return Some(entry.path());
+      }
+    }
+  }
+  None
+}
+
+/// Find the `<dir_name>.csv` companion (partial CSV), with the uuid-strip fallback.
+/// Excludes `_all.csv` files (those are picked up by [`find_sibling_all_csv`]).
+fn find_sibling_partial_csv(parent: &Path, dir_name: &str) -> Option<PathBuf> {
+  let exact = parent.join(format!("{}.csv", dir_name));
+  if exact.exists() {
+    return Some(exact);
+  }
+  let prefix = format!("{} ", dir_name);
+  if let Ok(entries) = fs::read_dir(parent) {
+    for entry in entries.flatten() {
+      let name = match entry.file_name().into_string() {
+        Ok(s) => s,
+        Err(_) => continue,
+      };
+      if !name.ends_with(".csv") || name.ends_with("_all.csv") {
+        continue;
+      }
+      let Some(rest) = name.strip_prefix(&prefix) else {
+        continue;
+      };
+      let stem_tail = rest.trim_end_matches(".csv");
+      if is_lowercase_hex_32(stem_tail) {
+        return Some(entry.path());
+      }
+    }
+  }
+  None
 }
 
 fn process_space_dir(
@@ -375,9 +499,15 @@ fn process_csv_file(
   // For example, if the CSV file is named "abc_all.csv", a folder named "abc" will also be created.
   // In such cases, we should skip processing the CSV file.
   if let Some(parent) = path.parent() {
-    let parent_path = parent.join(file_name.trim_end_matches("_all.csv"));
-    if parent_path.is_dir() {
+    let csv_stem = file_name.trim_end_matches("_all.csv");
+    if parent.join(csv_stem).is_dir() {
       return None;
+    }
+    // Same May 2026+ Notion compat: folder may have been emitted without the uuid.
+    if let Some(stem_no_uuid) = strip_trailing_notion_uuid(csv_stem) {
+      if parent.join(stem_no_uuid).is_dir() {
+        return None;
+      }
     }
   }
 
@@ -432,6 +562,14 @@ fn process_md_file(
     let corresponding_dir = parent.join(file_stem);
     if corresponding_dir.is_dir() {
       return None; // Skip .md or .csv file if there's a corresponding directory
+    }
+    // Notion's May 2026+ exports drop the uuid suffix from the companion folder name
+    // (e.g. `Foo <uuid>.md` paired with `Foo/`). Check that variant too — otherwise
+    // the .md and folder both surface as separate top-level views in AppFlowy.
+    if let Some(stem_no_uuid) = strip_trailing_notion_uuid(file_stem) {
+      if parent.join(stem_no_uuid).is_dir() {
+        return None;
+      }
     }
   }
 
@@ -857,6 +995,251 @@ mod name_and_id_from_path_tests {
     let (name, id) = name_and_id_from_path(path).unwrap();
     assert_eq!(name, "v0 7 2");
     assert_eq!(id.unwrap(), "11f96b61692380489555ecb38b723e46");
+  }
+}
+
+#[cfg(test)]
+mod strip_trailing_notion_uuid_tests {
+  use super::*;
+
+  #[test]
+  fn old_format_with_uuid() {
+    let stem = "Foo 104d4deadd2c805fb3abcaab6d3727e7";
+    assert_eq!(strip_trailing_notion_uuid(stem), Some("Foo"));
+  }
+
+  #[test]
+  fn name_with_internal_spaces() {
+    let stem = "Foo Bar Baz 104d4deadd2c805fb3abcaab6d3727e7";
+    assert_eq!(strip_trailing_notion_uuid(stem), Some("Foo Bar Baz"));
+  }
+
+  #[test]
+  fn no_uuid_returns_none() {
+    assert_eq!(strip_trailing_notion_uuid("Foo"), None);
+    assert_eq!(strip_trailing_notion_uuid("Plain Title No Hash"), None);
+  }
+
+  #[test]
+  fn short_input_returns_none() {
+    assert_eq!(strip_trailing_notion_uuid(""), None);
+    assert_eq!(strip_trailing_notion_uuid("abc"), None);
+  }
+
+  #[test]
+  fn non_hex_trailing_returns_none() {
+    // 32 chars but contains 'z' (not hex)
+    let stem = "Foo 104d4deadd2c805fb3abcaab6d3727ez";
+    assert_eq!(strip_trailing_notion_uuid(stem), None);
+  }
+
+  #[test]
+  fn upper_hex_not_accepted() {
+    // Notion uses lowercase hex; uppercase isn't expected
+    let stem = "Foo 104D4DEADD2C805FB3ABCAAB6D3727E7";
+    assert_eq!(strip_trailing_notion_uuid(stem), None);
+  }
+}
+
+#[cfg(test)]
+mod find_sibling_tests {
+  use super::*;
+  use std::fs;
+  use std::io::Write;
+
+  fn touch(path: &Path) {
+    let mut f = fs::File::create(path).unwrap();
+    f.write_all(b"").unwrap();
+  }
+
+  #[test]
+  fn finds_md_with_uuid_when_dir_lacks_uuid() {
+    // New format: folder "Foo" + sibling "Foo <uuid>.md"
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path();
+    let md = parent.join("Foo 104d4deadd2c805fb3abcaab6d3727e7.md");
+    touch(&md);
+    fs::create_dir(parent.join("Foo")).unwrap();
+
+    let found = find_sibling_with_ext(parent, "Foo", "md");
+    assert_eq!(found, Some(md));
+  }
+
+  #[test]
+  fn finds_md_with_exact_match_when_uuids_match() {
+    // Old format: folder "Foo <uuid>" + sibling "Foo <uuid>.md"
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path();
+    let dir_name = "Foo 104d4deadd2c805fb3abcaab6d3727e7";
+    let md = parent.join(format!("{}.md", dir_name));
+    touch(&md);
+    fs::create_dir(parent.join(dir_name)).unwrap();
+
+    let found = find_sibling_with_ext(parent, dir_name, "md");
+    assert_eq!(found, Some(md));
+  }
+
+  #[test]
+  fn no_md_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path();
+    fs::create_dir(parent.join("Foo")).unwrap();
+    assert_eq!(find_sibling_with_ext(parent, "Foo", "md"), None);
+  }
+
+  #[test]
+  fn does_not_match_partial_prefix() {
+    // "FooBar <uuid>.md" must NOT match a folder named "Foo"
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path();
+    touch(&parent.join("FooBar 104d4deadd2c805fb3abcaab6d3727e7.md"));
+    fs::create_dir(parent.join("Foo")).unwrap();
+    assert_eq!(find_sibling_with_ext(parent, "Foo", "md"), None);
+  }
+
+  #[test]
+  fn finds_all_csv_with_uuid_when_dir_lacks_uuid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path();
+    let csv = parent.join("Tasks 76aaf8a4637542ed8175259692ca08bb_all.csv");
+    touch(&csv);
+    fs::create_dir(parent.join("Tasks")).unwrap();
+
+    assert_eq!(find_sibling_all_csv(parent, "Tasks"), Some(csv));
+  }
+
+  #[test]
+  fn partial_csv_does_not_match_all_csv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path();
+    touch(&parent.join("Tasks 76aaf8a4637542ed8175259692ca08bb_all.csv"));
+    // find_sibling_partial_csv must skip the `_all.csv` file
+    assert_eq!(find_sibling_partial_csv(parent, "Tasks"), None);
+  }
+}
+
+#[cfg(test)]
+mod process_entry_new_format_tests {
+  use super::*;
+  use crate::notion::NotionExportContext;
+  use std::fs;
+  use std::io::Write;
+
+  fn touch(path: &Path, content: &[u8]) {
+    let mut f = fs::File::create(path).unwrap();
+    f.write_all(content).unwrap();
+  }
+
+  #[test]
+  fn nests_uuidless_folder_into_md_page() {
+    // Mirror our actual May 2026 Notion export structure:
+    //   Private & Shared/
+    //     Accounts 2a9c5346e7ef80e99ae2c15ebfbf65f5.md
+    //     Accounts/
+    //       Sub Page b1ec5346e7ef80abc7d9e1c8f7b5a4d3.md
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Private & Shared");
+    fs::create_dir(&root).unwrap();
+    touch(
+      &root.join("Accounts 2a9c5346e7ef80e99ae2c15ebfbf65f5.md"),
+      b"# Accounts\n\n[Sub Page](Accounts/Sub%20Page%20b1ec5346e7ef80abc7d9e1c8f7b5a4d3.md)\n",
+    );
+    let accounts_dir = root.join("Accounts");
+    fs::create_dir(&accounts_dir).unwrap();
+    touch(
+      &accounts_dir.join("Sub Page b1ec5346e7ef80abc7d9e1c8f7b5a4d3.md"),
+      b"# Sub Page\n",
+    );
+
+    // Walk root and collect top-level pages.
+    let ctx = NotionExportContext {
+      csv_relation: crate::notion::importer::CSVRelation::default(),
+      no_subpages: false,
+    };
+    let entries: Vec<_> = walk_sub_dir(&root);
+    let pages: Vec<NotionPage> = entries
+      .iter()
+      .filter_map(|e| process_entry("http://x", "00000000-0000-0000-0000-000000000000", e, false, &ctx))
+      .collect();
+
+    // EXPECT: exactly one top-level page ("Accounts"). Pre-patch this was TWO
+    // (the .md and the folder both surfaced as separate views).
+    assert_eq!(
+      pages.len(),
+      1,
+      "expected 1 top-level page, got {} → {:?}",
+      pages.len(),
+      pages.iter().map(|p| &p.notion_name).collect::<Vec<_>>(),
+    );
+    let accounts = &pages[0];
+    assert_eq!(accounts.notion_name, "Accounts");
+    // Page should carry the uuid from the .md filename, not the dir (which has none).
+    assert_eq!(
+      accounts.notion_id.as_deref(),
+      Some("2a9c5346e7ef80e99ae2c15ebfbf65f5"),
+    );
+    // Page should have the sub-page nested as a child.
+    assert_eq!(
+      accounts.children.len(),
+      1,
+      "Accounts should have 1 child sub-page, got {}",
+      accounts.children.len(),
+    );
+    assert_eq!(accounts.children[0].notion_name, "Sub Page");
+  }
+
+  #[test]
+  fn flat_md_without_folder_still_imports() {
+    // Standalone .md (no sibling folder) must still produce a page.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Private & Shared");
+    fs::create_dir(&root).unwrap();
+    touch(
+      &root.join("Standalone 3a9c5346e7ef80e99ae2c15ebfbf65f5.md"),
+      b"# Standalone\n",
+    );
+
+    let ctx = NotionExportContext {
+      csv_relation: crate::notion::importer::CSVRelation::default(),
+      no_subpages: false,
+    };
+    let entries: Vec<_> = walk_sub_dir(&root);
+    let pages: Vec<NotionPage> = entries
+      .iter()
+      .filter_map(|e| process_entry("http://x", "00000000-0000-0000-0000-000000000000", e, false, &ctx))
+      .collect();
+
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].notion_name, "Standalone");
+    assert_eq!(pages[0].children.len(), 0);
+  }
+
+  #[test]
+  fn legacy_uuid_folder_still_works() {
+    // Old format (folder name carries the uuid) must continue to work.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Private & Shared");
+    fs::create_dir(&root).unwrap();
+    let stem = "Legacy 104d4deadd2c805fb3abcaab6d3727e7";
+    touch(&root.join(format!("{}.md", stem)), b"# Legacy\n");
+    fs::create_dir(root.join(stem)).unwrap();
+
+    let ctx = NotionExportContext {
+      csv_relation: crate::notion::importer::CSVRelation::default(),
+      no_subpages: false,
+    };
+    let entries: Vec<_> = walk_sub_dir(&root);
+    let pages: Vec<NotionPage> = entries
+      .iter()
+      .filter_map(|e| process_entry("http://x", "00000000-0000-0000-0000-000000000000", e, false, &ctx))
+      .collect();
+
+    assert_eq!(pages.len(), 1, "{:?}", pages.iter().map(|p| &p.notion_name).collect::<Vec<_>>());
+    assert_eq!(pages[0].notion_name, "Legacy");
+    assert_eq!(
+      pages[0].notion_id.as_deref(),
+      Some("104d4deadd2c805fb3abcaab6d3727e7"),
+    );
   }
 }
 
